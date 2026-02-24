@@ -1,0 +1,46 @@
+name: Airflow CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8
+        # Add basic test requirements if we choose to add unit tests
+        # pip install pytest
+        
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Build Airflow Docker Image
+      run: |
+        docker build -t lark-databricks-airflow:latest .
+
+    - name: Test Airflow configuration
+      run: |
+        # Start Airflow using docker-compose to verify it comes up cleanly.
+        # Note: in a real pipeline we might wait for the healthchecks.
+        docker-compose up -d airflow-init
+        docker-compose up -d airflow-webserver airflow-scheduler
+        # Just check if containers started successfully
+        docker ps
