@@ -7,7 +7,6 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from dotenv import load_dotenv
-
 import requests
 
 # Add the dags folder to sys.path so we can import our modules
@@ -19,7 +18,7 @@ from databricks_extract import DatabricksExtractor
 from bigquery_upload import BigQueryUploader
 
 # Load environment variables
-dotenv_path = os.path.join(DAGS_FOLDER, '..', '.env')
+dotenv_path = os.path.join(DAGS_FOLDER, '..', './.env')
 load_dotenv(dotenv_path)
 
 LARK_APP_ID = os.getenv('LARK_APP_ID')
@@ -229,7 +228,7 @@ def task_fetch_and_transform_to_csv(**kwargs):
     df_att = transform_attendance_data(records)
     df_app = transform_approval_data(approvals)
 
-    date_str = datetime.now().strftime('%Y%m%d')
+    date_str = datetime.now().strftime('_%H%M_%d%m%Y')
     # Save to local CSV
     os.makedirs('/tmp/lark_data', exist_ok=True)
     df_emp.to_csv(f'/tmp/lark_data/lark_employees_{date_str}.csv', index=False)
@@ -250,7 +249,7 @@ def task_upload_to_gcs_bronze(**kwargs):
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = BIGQUERY_CREDENTIALS_PATH
     gcs_hook = GCSHook()
 
-    date_str = datetime.now().strftime('%Y%m%d')
+    date_str = datetime.now().strftime('_%H%M_%d%m%Y')
     files = [f'lark_employees_{date_str}.csv', f'lark_attendance_{date_str}.csv', f'lark_approvals_{date_str}.csv']
     
     for filename in files:
@@ -267,13 +266,13 @@ def task_upload_to_gcs_bronze(**kwargs):
 
 
 def task_databricks_load_silver(**kwargs):
-    """Load CSV from GCS into Databricks Delta Tables (Silver Layer)"""
-    logger.info("Task 3: Load Data to Databricks (Silver Layer)")
+    """Load CSV from local tmp into Databricks Delta Tables (Silver Layer) directly via INSERT"""
+    logger.info("Task 3: Load Data to Databricks (Silver Layer) via INSERT")
     from databricks import sql as databricks_sql
     
     schema = f'{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}'
     host = DATABRICKS_HOST.replace('https://', '').replace('http://', '')
-    date_str = datetime.now().strftime('%Y%m%d')
+    date_str = datetime.now().strftime('_%H%M_%d%m%Y')
     
     with databricks_sql.connect(
         server_hostname=host,
@@ -289,28 +288,42 @@ def task_databricks_load_silver(**kwargs):
                 ('silver_lark_approvals', f'lark_approvals_{date_str}.csv', "user_id STRING, approval_type STRING, start_time STRING, end_time STRING, unit STRING, duration STRING, reason STRING")
             ]
             
-            # Using COPY INTO to load data from GCS into Delta tables
+            # Using INSERT INTO to load data directly from local Airflow container
             for table_name, filename, table_schema in tables:
                 full_table_name = f"{schema}.{table_name}"
                 cursor.execute(f"CREATE TABLE IF NOT EXISTS {full_table_name} ({table_schema}) USING DELTA")
                 
-                # Requires Databricks to have access to GCS (e.g., IAM role or Storage Credential)
-                gcs_uri = f"gs://{GCS_BUCKET_NAME}/raw/{date_str}/{filename}"
-                logger.info(f"Running COPY INTO {full_table_name} from {gcs_uri}")
-                
-                # The credentials can be passed directly or assumed to be configured on the Databricks cluster/SQL warehouse
-                # Note: If no Storage Credential is set up in Unity Catalog, this might require explicit credentials.
-                # Assuming Unity Catalog Storage Credential is used as per Enterprise standards.
+                local_path = f'/tmp/lark_data/{filename}'
+                if not os.path.exists(local_path):
+                    logger.warning(f"File {local_path} not found. Skipping.")
+                    continue
+                                
                 try:
-                    cursor.execute(f"""
-                        COPY INTO {full_table_name}
-                        FROM '{gcs_uri}'
-                        FILEFORMAT = CSV
-                        FORMAT_OPTIONS ('header' = 'true', 'inferSchema' = 'false')
-                        COPY_OPTIONS ('mergeSchema' = 'true')
-                    """)
+                    df = pd.read_csv(local_path)
+                    if df.empty:
+                        logger.info(f"File {local_path} is empty, skipping table.")
+                        continue
+                        
+                    df = df.where(pd.notnull(df), None)
+                    columns = df.columns.tolist()
+                    cols_str = ", ".join(columns)
+                    
+                    batch_size = 500
+                    logger.info(f"Running INSERT INTO {full_table_name} from local CSV ({len(df)} rows)")
+                    
+                    # Create parameterized query "(?, ?, ?)" based on column count
+                    placeholders = ", ".join(["?"] * len(columns))
+                    insert_query = f"INSERT INTO {full_table_name} ({cols_str}) VALUES ({placeholders})"
+                    
+                    for start_idx in range(0, len(df), batch_size):
+                        batch_df = df.iloc[start_idx:start_idx+batch_size]
+                        
+                        # Convert DataFrame batch to list of lists, treating None as NULL naturally via parameterized execution
+                        parameters = batch_df.values.tolist()
+                        
+                        cursor.executemany(insert_query, parameters)
                 except Exception as e:
-                    logger.error(f"Failed to copy into {full_table_name}. Did you set up Databricks GCS access? Error: {e}")
+                    logger.error(f"Failed to insert into {full_table_name}. Error: {e}")
                     raise
 
 
@@ -338,9 +351,10 @@ def task_databricks_transform_gold(**kwargs):
                     e.user_id,
                     e.name,
                     e.employee_no,
-                    COUNT(a.day) as total_days_worked
+                    COUNT(DISTINCT a.day) as total_days_worked
                 FROM {schema}.silver_lark_employees e
                 LEFT JOIN {schema}.silver_lark_attendance a ON e.user_id = a.user_id
+                WHERE a.day IS NOT NULL AND a.check_in_result = 'NoNeedCheck' AND a.check_out_result = 'NoNeedCheck'
                 GROUP BY e.user_id, e.name, e.employee_no
             """)
             logger.info(f"Created Gold Table: {gold_table_name}")
@@ -352,9 +366,9 @@ def task_databricks_to_bigquery(**kwargs):
     extractor = DatabricksExtractor()
     uploader = BigQueryUploader()
     
-    date_str = datetime.now().strftime('%Y%m%d')
-    tables_to_sync = ['silver_lark_employees', 'silver_lark_attendance', 'silver_lark_approvals', 'gold_lark_attendance_summary']
-    
+    date_str = datetime.now().strftime('_%H%M_%d%m%Y')
+    tables_to_sync = ['silver_lark_employees', 'silver_lark_attendance', 'silver_lark_approvals']
+
     for table in tables_to_sync:
         bq_table_name = f"{table}_{date_str}"
         logger.info(f"Syncing Databricks table {table} to BigQuery table {bq_table_name}...")
@@ -367,6 +381,32 @@ def task_databricks_to_bigquery(**kwargs):
         except Exception as e:
             logger.error(f"Error syncing table {table} to {bq_table_name}: {e}")
             raise
+    
+    # Run Gold sync separately (assuming T4 has already run and created it if we run sequentially, 
+    # but in parallel (T3 -> [T4, T5]) T4 will have its own separate export flow.
+    # Therefore we remove Gold from T5 and create a new task T6 for exporting gold table.
+    pass
+
+def task_databricks_to_bigquery_gold(**kwargs):
+    """Extract from Databricks Gold and upload to BigQuery (runs after T4)"""
+    logger.info("Task 6: Extract from Databricks Gold and Load to BigQuery")
+    extractor = DatabricksExtractor()
+    uploader = BigQueryUploader()
+    
+    date_str = datetime.now().strftime('_%H%M_%d%m%Y')
+    table = 'gold_lark_attendance_summary'
+    bq_table_name = f"{table}_{date_str}"
+    
+    logger.info(f"Syncing Databricks table {table} to BigQuery table {bq_table_name}...")
+    try:
+        df = extractor.extract_table(table)
+        if df is not None and not df.empty:
+            uploader.upload_dataframe(df, bq_table_name, mode="WRITE_TRUNCATE")
+        else:
+            logger.info(f"Databricks table {table} is empty. Skipping upload to BigQuery.")
+    except Exception as e:
+        logger.error(f"Error syncing table {table} to {bq_table_name}: {e}")
+        raise
 
 # =============================================
 # DAG Definition
@@ -414,10 +454,21 @@ t4 = PythonOperator(
 )
 
 t5 = PythonOperator(
-    task_id='databricks_to_bigquery',
+    task_id='databricks_to_bigquery_silver',
     python_callable=task_databricks_to_bigquery,
     dag=dag,
 )
 
-# Pipeline Definition
-t1 >> t2 >> t3 >> t4 >> t5
+t6 = PythonOperator(
+    task_id='databricks_to_bigquery_gold',
+    python_callable=task_databricks_to_bigquery_gold,
+    dag=dag,
+)
+
+# Pipeline Definition:
+# T1 -> T2 -> T3
+# T3 branches to T4 and T5
+# T4 -> T6
+t1 >> t2 >> t3
+t3 >> t4 >> t6
+t3 >> t5

@@ -47,12 +47,18 @@ class DatabricksExtractor:
             with connection.cursor() as cursor:
                 try:
                     cursor.execute(query)
-                    # Fetching all rows and converting to pandas DataFrame
-                    rows = cursor.fetchall()
-                    # Get column names from cursor description
-                    columns = [desc[0] for desc in cursor.description]
                     
-                    df = pd.DataFrame(rows, columns=columns)
+                    # Optimization: Use Arrow for much faster and memory-efficient extraction
+                    # compared to cursor.fetchall()
+                    arrow_table = cursor.fetchall_arrow()
+                    
+                    if arrow_table is None or arrow_table.num_rows == 0:
+                        logger.info(f"Table {full_table_name} is empty.")
+                        # Get columns just in case to return empty df with schema
+                        columns = [desc[0] for desc in cursor.description]
+                        return pd.DataFrame(columns=columns)
+                    
+                    df = arrow_table.to_pandas()
                     logger.info(f"Successfully extracted {len(df)} rows from {full_table_name}")
                     return df
                 except Exception as e:

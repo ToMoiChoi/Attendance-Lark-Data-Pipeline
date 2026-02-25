@@ -10,10 +10,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     # Environment variables from .env will be loaded if you supply an env_file
     # below or place a .env file in the same directory.
+  env_file:
+    - .env
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./gcp-key.json:/opt/airflow/gcp-key.json
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on: &airflow-common-depends-on
     postgres:
