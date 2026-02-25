@@ -38,9 +38,9 @@ jobs:
 
     - name: Test Airflow configuration
       run: |
-        # Start Airflow using docker-compose to verify it comes up cleanly.
+        # Start Airflow using docker compose to verify it comes up cleanly.
         # Note: in a real pipeline we might wait for the healthchecks.
-        docker-compose up -d airflow-init
-        docker-compose up -d airflow-webserver airflow-scheduler
+        docker compose up -d airflow-init
+        docker compose up -d airflow-webserver airflow-scheduler
         # Just check if containers started successfully
         docker ps
